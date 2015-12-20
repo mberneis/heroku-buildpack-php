@@ -107,6 +107,91 @@ Please change its contents to at least '{}' so it is valid JSON."
     echo "{}" > $COMPOSER
 fi
 
+
+
+status "Compiling client-side code using Node"
+
+# Output npm debug info on error
+trap cat_npm_debug_log ERR
+
+# Look in package.json's engines.node field for a semver range
+semver_range=$(cat $BUILD_DIR/package.json | $BP_DIR/vendor/jq -r .engines.node)
+
+# Resolve node version using semver.io
+node_version=$(curl --silent --get --data-urlencode "range=${semver_range}" https://semver.io/node/resolve)
+
+# Recommend using semver ranges in a safe manner
+if [ "$semver_range" == "null" ]; then
+  protip "Specify a node version in package.json"
+  semver_range=""
+elif [ "$semver_range" == "*" ]; then
+  protip "Avoid using semver ranges like '*' in engines.node"
+elif [ ${semver_range:0:1} == ">" ]; then
+  protip "Avoid using semver ranges starting with '>' in engines.node"
+fi
+
+# Output info about requested range and resolved node version
+if [ "$semver_range" == "" ]; then
+  status "Defaulting to latest stable node: $node_version"
+else
+  status "Requested node range:  $semver_range"
+  status "Resolved node version: $node_version"
+fi
+
+# Download node from Heroku's S3 mirror of nodejs.org/dist
+status "Downloading and installing node"
+node_url="http://s3pository.heroku.com/node/v$node_version/node-v$node_version-linux-x64.tar.gz"
+curl $node_url -s -o - | tar xzf - -C $BUILD_DIR
+
+# Move node (and npm) into ./vendor and make them executable
+mkdir -p $BUILD_DIR/vendor
+mv $BUILD_DIR/node-v$node_version-linux-x64 $BUILD_DIR/vendor/node
+chmod +x $BUILD_DIR/vendor/node/bin/*
+PATH=$PATH:$BUILD_DIR/vendor/node/bin
+
+# Run subsequent node/npm commands from the build path
+cd $BUILD_DIR
+
+# If node_modules directory is checked into source control then
+# rebuild any native deps. Otherwise, restore from the build cache.
+if test -d $BUILD_DIR/node_modules; then
+  status "Found existing node_modules directory; skipping cache"
+  status "Rebuilding any native dependencies"
+  npm rebuild 2>&1 | indent
+elif test -d $NODE_CACHE_DIR/node/node_modules; then
+  status "Restoring node_modules directory from cache"
+  cp -r $NODE_CACHE_DIR/node/node_modules $BUILD_DIR/
+
+  status "Pruning cached dependencies not specified in package.json"
+  npm prune 2>&1 | indent
+
+  if test -f $NODE_CACHE_DIR/node/.heroku/node-version && [ $(cat $NODE_CACHE_DIR/node/.heroku/node-version) != "$node_version" ]; then
+    status "Node version changed since last build; rebuilding dependencies"
+    npm rebuild 2>&1 | indent
+  fi
+fi
+
+# Handle npm's new cert bug
+# http://blog.npmjs.org/post/78085451721/npms-self-signed-certificate-is-no-more
+if [ ! -f "$BUILD_DIR/.npmrc" ]; then
+  status "Writing a custom .npmrc to circumvent npm bugs"
+  echo "ca=" > "$BUILD_DIR/.npmrc"
+fi
+
+# Scope config var availability only to `npm install`
+(
+  if [ -d "$ENV_DIR" ]; then
+    status "Exporting config vars to environment"
+    export_env_dir $ENV_DIR
+  fi
+
+  status "Installing dependencies"
+  # Make npm output to STDOUT instead of its default STDERR
+  npm install --userconfig $BUILD_DIR/.npmrc --production 2>&1 | indent
+)
+
+
+
 # all system packages live in there
 mkdir -p $BUILD_DIR/.heroku/php
 # set up Composer
