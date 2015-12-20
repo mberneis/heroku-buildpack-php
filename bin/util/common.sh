@@ -53,3 +53,7 @@ export_env_dir() {
     done
   fi
 }
+
+cat_npm_debug_log() {
+  test -f $BUILD_DIR/npm-debug.log && cat $BUILD_DIR/npm-debug.log
+}
